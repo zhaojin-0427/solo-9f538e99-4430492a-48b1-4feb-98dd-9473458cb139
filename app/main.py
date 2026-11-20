@@ -6,11 +6,14 @@ UTC 毫秒时间线供潮位分析：
   POST /observations   分批提交观测（ID、开机段、计数、潮位）
   POST /calibrations   分批提交校时点（开机段、计数、UTC 毫秒）
   GET  /tide-levels    按 UTC 毫秒范围查可用潮位
+  GET  /tide-segments  按后一拐点的 UTC 毫秒范围查潮段
   GET  /observations/{obs_id}  按观测 ID 查状态与原因
   GET  /docs           Swagger UI
 """
 
 from __future__ import annotations
+
+import math
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -53,20 +56,41 @@ class ChangedState(BaseModel):
     status: str
 
 
+class TideSegment(BaseModel):
+    boot_segment: str = Field(description="开机段")
+    direction: str = Field(description="涨落方向：rising 涨潮 / falling 落潮")
+    start_utc_ms: int = Field(description="较早拐点时刻（UTC 毫秒）")
+    start_tide_level: float | str = Field(description="较早拐点潮位")
+    start_obs_id: str = Field(description="较早拐点的观测 ID")
+    end_utc_ms: int = Field(description="较晚拐点时刻（UTC 毫秒）")
+    end_tide_level: float | str = Field(description="较晚拐点潮位")
+    end_obs_id: str = Field(description="较晚拐点的观测 ID")
+    tidal_range: float | str = Field(description="潮差：两端潮位之差的绝对值")
+
+
 class BatchResult(BaseModel):
     changed_count: int = Field(description="本次提交中时刻或状态变化的观测数")
     changed: list[ChangedState] = Field(description="时刻或状态变化的观测")
+    segments_added_count: int = Field(description="本次列入的潮段数")
+    segments_added: list[TideSegment] = Field(description="本次列入的潮段")
+    segments_removed_count: int = Field(description="本次撤下的潮段数")
+    segments_removed: list[TideSegment] = Field(description="本次撤下的潮段")
 
 
 class TidePoint(BaseModel):
     obs_id: str
     utc_ms: int
-    tide_level: float
+    tide_level: float | str
 
 
 class TideQueryResult(BaseModel):
     count: int
     items: list[TidePoint]
+
+
+class TideSegmentQueryResult(BaseModel):
+    count: int
+    items: list[TideSegment]
 
 
 class CalibrationEndpoint(BaseModel):
@@ -83,7 +107,7 @@ class ObservationDetail(BaseModel):
     obs_id: str
     boot_segment: str
     counter: int
-    tide_level: float
+    tide_level: float | str
     utc_ms: int | None
     status: str = Field(description="ok / pending_calibration / conflict")
     reason: str | None
@@ -96,17 +120,18 @@ class ObservationDetail(BaseModel):
 def submit_observations(batch: ObservationBatch) -> BatchResult:
     """写入观测原文并按当前校时点换算；同一 obs_id 重复提交会覆盖原文并重算。
 
-    响应列出本次提交中时刻或状态发生变化的观测 ID（含新观测，
-    以及因新观测落入同一 UTC 毫秒而被卷入/解除冲突的观测）。
+    响应保留原有字段：本次提交中时刻或状态发生变化的观测 ID（含新观测，
+    以及因新观测落入同一 UTC 毫秒而被卷入/解除冲突的观测）；并列出本次
+    新增（segments_added）和撤下（segments_removed）的潮段。
     """
     conn = db.get_conn()
     with db.lock():
         with db.transaction(conn):
-            ids = core.upsert_observations(
+            outcome = core.upsert_observations(
                 conn, [o.model_dump() for o in batch.observations]
             )
-            changed = core.fetch_states(conn, ids)
-    return BatchResult(changed_count=len(changed), changed=changed)
+            changed = core.fetch_states(conn, outcome.changed_ids)
+    return _batch_result(changed, outcome)
 
 
 @app.post("/calibrations", response_model=BatchResult, summary="分批提交校时点")
@@ -114,13 +139,13 @@ def submit_calibrations(batch: CalibrationBatch) -> BatchResult:
     """写入校时点；同段同计数的新校时点替换旧值，并重算受影响观测。
 
     若合并后任一开机段内 UTC 随计数倒退，则整批拒绝（409），旧数据照常供数。
-    响应列出本次提交中时刻或状态发生变化的观测 ID。
+    响应列出本次提交中时刻或状态发生变化的观测 ID，以及新增/撤下的潮段。
     """
     conn = db.get_conn()
     with db.lock():
         with db.transaction(conn):
             try:
-                ids = core.upsert_calibrations(
+                outcome = core.upsert_calibrations(
                     conn, [c.model_dump() for c in batch.calibrations]
                 )
             except core.MonotonicViolation as exc:
@@ -131,8 +156,44 @@ def submit_calibrations(batch: CalibrationBatch) -> BatchResult:
                         "violations": exc.violations,
                     },
                 )
-            changed = core.fetch_states(conn, ids)
-    return BatchResult(changed_count=len(changed), changed=changed)
+            changed = core.fetch_states(conn, outcome.changed_ids)
+    return _batch_result(changed, outcome)
+
+
+def _json_level(value: float) -> float | str:
+    """JSON 不支持非有限数，按约定序列化为字符串。"""
+    if math.isnan(value):
+        return "nan"
+    if math.isinf(value):
+        return "inf" if value > 0 else "-inf"
+    return value
+
+
+def _segment_model(seg: dict) -> TideSegment:
+    return TideSegment(
+        boot_segment=seg["boot_segment"],
+        direction=seg["direction"],
+        start_utc_ms=seg["start_utc_ms"],
+        start_tide_level=_json_level(seg["start_tide_level"]),
+        start_obs_id=seg["start_obs_id"],
+        end_utc_ms=seg["end_utc_ms"],
+        end_tide_level=_json_level(seg["end_tide_level"]),
+        end_obs_id=seg["end_obs_id"],
+        tidal_range=_json_level(seg["tidal_range"]),
+    )
+
+
+def _batch_result(changed: list[dict], outcome: core.BatchOutcome) -> BatchResult:
+    added = [_segment_model(s) for s in outcome.added_segments]
+    removed = [_segment_model(s) for s in outcome.removed_segments]
+    return BatchResult(
+        changed_count=len(changed),
+        changed=changed,
+        segments_added_count=len(added),
+        segments_added=added,
+        segments_removed_count=len(removed),
+        segments_removed=removed,
+    )
 
 
 # ---------------------------------------------------------------- 查询
@@ -148,16 +209,50 @@ def tide_levels(
     conn = db.get_conn()
     with db.lock():
         rows = conn.execute(
-            "SELECT obs_id, utc_ms, tide_level FROM observations "
+            "SELECT obs_id, utc_ms, tide_level, tide_level_nonfinite FROM observations "
             "WHERE status = ? AND utc_ms BETWEEN ? AND ? "
             "ORDER BY utc_ms, obs_id",
             (core.OK, start_ms, end_ms),
         ).fetchall()
     items = [
-        TidePoint(obs_id=r["obs_id"], utc_ms=r["utc_ms"], tide_level=r["tide_level"])
+        TidePoint(
+            obs_id=r["obs_id"], utc_ms=r["utc_ms"],
+            tide_level=_json_level(core.decode_tide_level(
+                r["tide_level"], r["tide_level_nonfinite"])),
+        )
         for r in rows
     ]
     return TideQueryResult(count=len(items), items=items)
+
+
+@app.get(
+    "/tide-segments",
+    response_model=TideSegmentQueryResult,
+    summary="按后一拐点的 UTC 范围查潮段",
+)
+def tide_segments(
+    start_ms: int = Query(ge=0, description="后一拐点 UTC 毫秒下界（含）"),
+    end_ms: int = Query(ge=0, description="后一拐点 UTC 毫秒上界（含）"),
+) -> TideSegmentQueryResult:
+    """返回后一拐点（较晚拐点）落在 [start_ms, end_ms] 内的潮段。
+
+    潮段按开机段独立计算并持久保存；查询直接读表，不再现场推导。
+    各段单独给出涨落方向、两端时刻与潮位、观测 ID 和潮差。
+    """
+    if end_ms < start_ms:
+        raise HTTPException(status_code=422, detail="end_ms 不得小于 start_ms")
+    conn = db.get_conn()
+    with db.lock():
+        rows = conn.execute(
+            f"SELECT {', '.join(core.SEGMENT_FIELDS)} FROM tide_segments "
+            "WHERE end_utc_ms BETWEEN ? AND ? "
+            "ORDER BY end_utc_ms, start_utc_ms, boot_segment, start_obs_id, end_obs_id",
+            (start_ms, end_ms),
+        ).fetchall()
+    items = [
+        _segment_model({f: r[f] for f in core.SEGMENT_FIELDS}) for r in rows
+    ]
+    return TideSegmentQueryResult(count=len(items), items=items)
 
 
 @app.get(
@@ -187,7 +282,9 @@ def get_observation(obs_id: str) -> ObservationDetail:
         obs_id=row["obs_id"],
         boot_segment=row["boot_segment"],
         counter=row["counter"],
-        tide_level=row["tide_level"],
+        tide_level=_json_level(core.decode_tide_level(
+            row["tide_level"], row["tide_level_nonfinite"]
+        )),
         utc_ms=row["utc_ms"],
         status=row["status"],
         reason=row["reason"],
